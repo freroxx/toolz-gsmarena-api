@@ -2,7 +2,12 @@ const cheerio = require('cheerio');
 const { getDataFromUrl } = require('./utils');
 
 const search = async (searchValue) => {
-    const html = await getDataFromUrl(`/results.php3?sQuickSearch=yes&sName=${searchValue}`);
+    // Use URLSearchParams to properly encode the search query
+    const params = new URLSearchParams();
+    params.append('sQuickSearch', 'yes');
+    params.append('sName', searchValue);
+    
+    const html = await getDataFromUrl(`/results.php3?${params.toString()}`);
 
     const $ = cheerio.load(html);
     const json = [];
