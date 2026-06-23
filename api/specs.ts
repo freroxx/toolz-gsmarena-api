@@ -3,17 +3,19 @@ import type { VercelRequest, VercelResponse } from '@vercel/node';
 import * as cheerio from 'cheerio';
 
 // Centralized fetch tool with optional proxy (api.scraperapi.com)
-async function fetchHtml(targetUrl: string): Promise<{ text: string | null; status: number | null }> {
+async function fetchHtml(targetUrl: string): Promise<{ text: string | null; status: number | null; errorBody?: string }> {
   const apiKey = process.env.SCRAPER_API_KEY;
   let fetchUrl = targetUrl;
   if (apiKey) {
     const proxyUrl = new URL('https://api.scraperapi.com/');
     proxyUrl.searchParams.set('api_key', apiKey);
     proxyUrl.searchParams.set('url', targetUrl);
-    // Same Turnstile gate as the main site — needs render+ultra_premium to trigger
-    // ScraperAPI's Turnstile-solving pipeline, otherwise it's just a basic proxy.
-    proxyUrl.searchParams.set('render', 'true');
-    proxyUrl.searchParams.set('ultra_premium', 'true');
+    // render/premium/ultra_premium are paid-tier features — ScraperAPI 403s the
+    // whole request if your plan doesn't include them. Opt in via env vars so a
+    // free-plan key doesn't get rejected outright.
+    if (process.env.SCRAPER_RENDER === 'true') proxyUrl.searchParams.set('render', 'true');
+    if (process.env.SCRAPER_ULTRA_PREMIUM === 'true') proxyUrl.searchParams.set('ultra_premium', 'true');
+    else if (process.env.SCRAPER_PREMIUM === 'true') proxyUrl.searchParams.set('premium', 'true');
     fetchUrl = proxyUrl.toString();
   }
 
@@ -25,10 +27,11 @@ async function fetchHtml(targetUrl: string): Promise<{ text: string | null; stat
         'Referer': 'https://www.google.com/'
       }
     });
-    if (!response.ok) {
-      return { text: null, status: response.status };
-    }
     const text = await response.text();
+    if (!response.ok) {
+      console.error(`Fetch failed with status ${response.status} for ${targetUrl}. Body: ${text.slice(0, 500)}`);
+      return { text: null, status: response.status, errorBody: text.slice(0, 500) };
+    }
     return { text, status: response.status };
   } catch (e) {
     console.error('Network error fetching', targetUrl, e);
