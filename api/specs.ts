@@ -20,13 +20,15 @@ async function fetchHtml(targetUrl: string): Promise<{ text: string | null; stat
   }
 
   try {
-    const response = await fetch(fetchUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://www.google.com/'
-      }
-    });
+    // Only apply fixed headers if NOT using ScraperAPI to prevent TLS fingerprint mismatches
+    const headers: Record<string, string> = {};
+    if (!apiKey) {
+      headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+      headers['Accept-Language'] = 'en-US,en;q=0.9';
+      headers['Referer'] = 'https://www.google.com/';
+    }
+
+    const response = await fetch(fetchUrl, { headers });
     const text = await response.text();
     if (!response.ok) {
       console.error(`Fetch failed with status ${response.status} for ${targetUrl}. Body: ${text.slice(0, 500)}`);
@@ -49,7 +51,7 @@ async function scrapeGsmArenaSearch(query: string): Promise<string | null> {
 
   const lowered = html.toLowerCase();
   // If we hit Turnstile or anti-bot, return null so the caller can handle it
-  if (lowered.includes('cf-turnstile') || lowered.includes('turnstile') || lowered.includes('turnstile-verify')) {
+  if (lowered.includes('cf-turnstile') || lowered.includes('turnstile') || lowered.includes('turnstile-verify') || lowered.includes('one quick check before you continue')) {
     return null;
   }
 
@@ -57,13 +59,13 @@ async function scrapeGsmArenaSearch(query: string): Promise<string | null> {
   // If GSMArena redirected to product page (spec table present), prefer canonical
   if ($('#specs-list').length > 0) {
     const canonical = $('link[rel="canonical"]').attr('href') || $('meta[property="og:url"]').attr('content');
-    if (canonical) return canonical.startsWith('http') ? canonical : `https://www.gsmarena.com/${String(canonical).replace(/^\\//, '')}`;
+    if (canonical) return canonical.startsWith('http') ? canonical : `https://www.gsmarena.com/${String(canonical).replace(/^\//, '')}`;
     return searchUrl.toString();
   }
 
   // Normal listing page: pick the first device link
   let firstDeviceLink = $('.makers ul li a').first().attr('href') || $('.makers a').first().attr('href');
-  if (firstDeviceLink) return `https://www.gsmarena.com/${String(firstDeviceLink).replace(/^\\//, '')}`;
+  if (firstDeviceLink) return `https://www.gsmarena.com/${String(firstDeviceLink).replace(/^\//, '')}`;
 
   return null;
 }
@@ -72,7 +74,7 @@ async function scrapeDeviceSpecs(url: string) {
   const { text: html } = await fetchHtml(url);
   if (!html) return null;
 
-  // If Turnstile appears on the product page, bail (caller must handle)
+  // If Turnstile appears on the product page, bail
   if (html.toLowerCase().includes('cf-turnstile') || html.toLowerCase().includes('turnstile')) return null;
 
   const $ = cheerio.load(html);
@@ -113,30 +115,95 @@ function generateStrategies(input: string): string[] {
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  if (req.method === 'OPTIONS') return res.status(200).end();
-  if (req.method !== 'GET') return res.status(405).json({ error: 'Method Not Allowed' });
+  try {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  const raw = String(req.query.model || '').trim();
-  if (!raw) return res.status(400).json({ error: "Missing 'model' query parameter" });
+    if (req.method === 'OPTIONS') return res.status(200).end();
+    if (req.method !== 'GET') return res.status(405).json({ error: 'Method Not Allowed' });
 
-  const strategies = generateStrategies(raw);
-  const tried: any[] = [];
+    const raw = String(req.query.model || '').trim();
+    if (!raw) return res.status(400).json({ error: "Missing 'model' query parameter" });
 
-  for (const q of strategies) {
-    const url = await scrapeGsmArenaSearch(q);
-    tried.push({ query: q, matchedUrl: url });
-    if (url) {
-      const specs = await scrapeDeviceSpecs(url);
-      if (specs) {
-        return res.status(200).json({ source_url: url, specifications: specs });
+    // Limit strategies to top 3 variations to prevent hitting Vercel serverless execution timeout ceilings
+    const strategies = generateStrategies(raw).slice(0, 3);
+    const tried: any[] = [];
+    let targetDeviceUrl: string | null = null;
+
+    // 1. Direct Search Evaluation Phase
+    for (const q of strategies) {
+      const url = await scrapeGsmArenaSearch(q);
+      tried.push({ query: q, matchedUrl: url });
+      if (url) {
+        targetDeviceUrl = url;
+        break;
       }
-      // If product page returned but no specs (or Turnstile), return what we have or continue
-      return res.status(502).json({ error: 'Failed to extract specs from matched product page', source_url: url });
     }
-  }
 
-  // Nothing matched
-  return res.status(404).json({ error: `No match for '${raw}'`, tried });
+    // 2. Fallback Search Engine Discovery Phase (Triggers on Turnstile lockout or search failures)
+    if (!targetDeviceUrl) {
+      console.info('Fallback Microservice: Search index block encountered. Running alternative index resolution...');
+      try {
+        const ddgUrl = new URL('https://html.duckduckgo.com/html/');
+        ddgUrl.searchParams.set('q', `site:gsmarena.com ${raw}`);
+        const { text: ddgHtml } = await fetchHtml(ddgUrl.toString());
+
+        if (ddgHtml) {
+          const $ddg = cheerio.load(ddgHtml);
+          const discoveredLinks: string[] = [];
+
+          $ddg('a').each((_, el) => {
+            let href = $ddg(el).attr('href');
+            if (href && href.includes('gsmarena.com/')) {
+              if (href.includes('uddg=')) {
+                try {
+                  const urlParams = new URLSearchParams(href.substring(href.indexOf('?')));
+                  const exactUrl = urlParams.get('uddg');
+                  if (exactUrl) href = exactUrl;
+                } catch (e) {}
+              }
+
+              if (
+                href.includes('.php') &&
+                !href.includes('results.php') &&
+                !href.includes('search.php') &&
+                !href.includes('compare.php') &&
+                !href.includes('glossary.php') &&
+                !href.includes('blog.php')
+              ) {
+                discoveredLinks.push(href.startsWith('http') ? href : `https://www.gsmarena.com/${href.replace(/^\//, '')}`);
+              }
+            }
+          });
+
+          if (discoveredLinks.length > 0) {
+            targetDeviceUrl = discoveredLinks[0];
+            console.info('Fallback Microservice: Extracted target via discovery index traversal:', targetDeviceUrl);
+            tried.push({ query: raw, discoveryUrl: ddgUrl.toString(), matchedUrl: targetDeviceUrl, engine: 'duckduckgo' });
+          }
+        }
+      } catch (ddgError) {
+        console.error('Fallback Microservice Index Interception Failure:', ddgError);
+      }
+    }
+
+    // 3. Final Content Extraction Phase
+    if (targetDeviceUrl) {
+      const specs = await scrapeDeviceSpecs(targetDeviceUrl);
+      if (specs) {
+        return res.status(200).json({ source_url: targetDeviceUrl, specifications: specs });
+      }
+      return res.status(502).json({ error: 'Failed to extract specs from matched product page', source_url: targetDeviceUrl, tried });
+    }
+
+    // Nothing matched
+    return res.status(404).json({ error: `No match for '${raw}'`, tried });
+  } catch (globalError) {
+    console.error("Critical error inside fallback microservice handler execution:", globalError);
+    return res.status(500).json({ 
+      error: "Internal Server Error encountered inside the processing framework", 
+      details: String(globalError) 
+    });
+  }
 }
