@@ -20,3 +20,10 @@ module.exports = {
     isTurnstile: utils.isTurnstile,
     getRemainingTime: utils.getRemainingTime,
 };
+
+// ESM Interop support for bundlers and Node ESM loader
+module.exports.default = module.exports;
+module.exports.catalog = catalog;
+module.exports.discoverDevice = search.discoverDevice;
+module.exports.generateSmartStrategies = utils.generateSmartStrategies;
+
