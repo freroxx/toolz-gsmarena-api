@@ -48,6 +48,7 @@ function getRemainingTime(startTime, totalBudget, minBuffer = 500) {
 async function fetchHtml(targetUrl, signal = null, extraHeaders = {}, options = {}) {
     const primaryApiKey = process.env.SCRAPER_API_KEY;
     const backupApiKey = process.env.SCRAPER_API_KEY_1;
+    const tertiaryApiKey = process.env.SCRAPER_API_KEY_2;
     const { render = false, useProxy = true } = options;
 
     const performFetch = async (apiKey, keyName) => {
@@ -103,7 +104,8 @@ async function fetchHtml(targetUrl, signal = null, extraHeaders = {}, options = 
             const text = await response.text();
 
             if (!response.ok) {
-                return { text, status: response.status, errorBody: text.slice(0, 200) };
+                const retryAfter = response.headers.get('Retry-After') || undefined;
+                return { text, status: response.status, errorBody: text.slice(0, 200), retryAfter };
             }
 
             if (isTurnstile(text)) {
@@ -125,15 +127,31 @@ async function fetchHtml(targetUrl, signal = null, extraHeaders = {}, options = 
         }
     };
 
-    const initialKey = primaryApiKey || backupApiKey;
-    const initialName = primaryApiKey ? "Primary" : "Backup";
+    const initialKey = primaryApiKey || backupApiKey || tertiaryApiKey;
+    const initialName = primaryApiKey ? "Primary" : (backupApiKey ? "Backup" : "Tertiary");
     let result = await performFetch(initialKey, initialName);
+
+    // Handle rate-limit (429): honour Retry-After if within budget, then try next key
+    if (result.status === 429 && useProxy) {
+        const retryAfterHeader = result.retryAfter;
+        const waitMs = retryAfterHeader ? (parseInt(retryAfterHeader, 10) * 1000) : 2000;
+        if (waitMs < 5000) {
+            console.warn(`[Proxy] 429 from ${initialName}, waiting ${waitMs}ms then retrying with next key...`);
+            await new Promise(r => setTimeout(r, waitMs));
+        }
+        const nextKey = initialName === "Primary" ? (backupApiKey || tertiaryApiKey) : tertiaryApiKey;
+        const nextName = initialName === "Primary" ? (backupApiKey ? "Backup" : "Tertiary") : "Tertiary";
+        if (nextKey) result = await performFetch(nextKey, nextName);
+    }
 
     if (result.status === 403 && useProxy) {
         const isPrimaryExhausted = initialName === "Primary";
         if (isPrimaryExhausted && backupApiKey && backupApiKey !== primaryApiKey) {
             console.warn(`[Proxy] Primary key exhausted (403), retrying with Backup key...`);
             result = await performFetch(backupApiKey, "Backup");
+        } else if (tertiaryApiKey && tertiaryApiKey !== backupApiKey) {
+            console.warn(`[Proxy] Backup key exhausted (403), retrying with Tertiary key...`);
+            result = await performFetch(tertiaryApiKey, "Tertiary");
         }
     }
 

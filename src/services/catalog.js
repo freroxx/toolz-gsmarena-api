@@ -73,16 +73,18 @@ const getDevice = async (device, options = {}) => {
 
     let res = await fetchHtml(url, options.signal, {}, { render: false, useProxy: true });
 
+    // Always try render escalation on Turnstile or missing content when allowed
     if ((!res.text || res.turnstile) && options.allowRender) {
+        console.info(`[catalog.getDevice] Escalating to rendered fetch for: ${url}`);
         res = await fetchHtml(url, options.signal, {}, { render: true, useProxy: true });
     }
 
-    if (!res.text) return null;
+    if (!res.text || res.turnstile) return null;
 
     const $ = cheerio.load(res.text);
     const specs = {};
 
-    // Extract main image URL robustly
+    // Extract main image URL robustly — prefer bigpic CDN
     let img = '';
     const imgElement = $('.specs-photo-main img, #specs-cp-pic img, #specs-cp-main img, img[src*="/bigpic/"]').first();
     if (imgElement.length > 0) {
@@ -92,7 +94,13 @@ const getDevice = async (device, options = {}) => {
         }
     }
 
-    const name = $('.specs-phone-name-title').text();
+    // Extract device name — critical for matched_device in response chain
+    const name = (
+        $('.specs-phone-name-title').text().trim() ||
+        $('h1.specs-phone-name-title').text().trim() ||
+        $('meta[property="og:title"]').attr('content')?.trim() ||
+        ''
+    );
 
     // Extract all spec tables
     $('#specs-list table').each((_, table) => {
@@ -124,7 +132,7 @@ const getDevice = async (device, options = {}) => {
     return {
         name,
         img,
-        specifications: specs,
+        specifications: Object.keys(specs).length > 0 ? specs : null,
         quickSpec,
         // Keep old detailSpec format for legacy support
         detailSpec: Object.entries(specs).map(([category, specifications]) => ({

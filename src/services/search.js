@@ -13,14 +13,25 @@ const discoverDevice = async (query, signal = null, options = {}) => {
     let suggestImage = '';
     let sawTurnstile = false;
 
-    // Phase 1: Suggest API
+    // Phase 1: Suggest API — try direct first (fast, low-cost), then proxy as fallback
     const suggestResults = await Promise.all(
         strategies.slice(0, 3).map(async (q) => {
             const suggestUrl = `https://www.gsmarena.com/suggest.php3?sSearch=${encodeURIComponent(q)}`;
-            const res = await fetchHtml(suggestUrl, signal, {
+
+            // Attempt direct (no proxy) — fast & cheap, works when not rate-limited
+            let res = await fetchHtml(suggestUrl, signal, {
                 'X-Requested-With': 'XMLHttpRequest',
                 'Referer': 'https://www.gsmarena.com/'
             }, { render: false, timeoutMs: 2500, useProxy: false });
+
+            // If direct is blocked by Turnstile, fall back to proxy
+            if (res.turnstile || (!res.text && res.status && res.status >= 400)) {
+                console.info(`[discoverDevice] Suggest direct blocked (${res.status}), retrying via proxy for: ${q}`);
+                res = await fetchHtml(suggestUrl, signal, {
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Referer': 'https://www.gsmarena.com/'
+                }, { render: false, timeoutMs: 3000, useProxy: true });
+            }
 
             if (res.turnstile) return { turnstile: true };
             if (!res.text) return null;
@@ -54,7 +65,7 @@ const discoverDevice = async (query, signal = null, options = {}) => {
         }
     }
 
-    // Phase 2: Direct Search
+    // Phase 2: Direct Search (via proxy to avoid Cloudflare)
     if (!matchedUrl && !signal?.aborted) {
         if (getRemainingTime(startTime, totalBudget) > 4000) {
             for (const q of strategies.slice(0, 2)) {
@@ -63,7 +74,9 @@ const discoverDevice = async (query, signal = null, options = {}) => {
 
                 if (res.turnstile) {
                     sawTurnstile = true;
-                    if (getRemainingTime(startTime, totalBudget) > 6000) {
+                    // Always escalate to render on Turnstile if budget allows (lowered threshold: 4500 ms)
+                    if (getRemainingTime(startTime, totalBudget) > 4500) {
+                        console.info(`[discoverDevice] Turnstile on search, escalating to render for: ${q}`);
                         res = await fetchHtml(searchUrl, signal, {}, { render: true, timeoutMs: getRemainingTime(startTime, totalBudget) - 500, useProxy: true });
                     }
                 }
@@ -81,6 +94,8 @@ const discoverDevice = async (query, signal = null, options = {}) => {
                     }
                 }
                 if (getRemainingTime(startTime, totalBudget) < 3000) break;
+                // Small back-off between strategy attempts to avoid thundering-herd
+                await new Promise(r => setTimeout(r, 300));
             }
         }
     }
