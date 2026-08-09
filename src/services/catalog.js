@@ -1,10 +1,11 @@
 const cheerio = require('cheerio');
-const { getDataFromUrl } = require('./utils');
+const { fetchHtml } = require('./utils');
 
 const getBrands = async () => {
-    const html = await getDataFromUrl('/makers.php3');
+    const res = await fetchHtml('https://www.gsmarena.com/makers.php3');
+    if (!res.text) return [];
 
-    const $ = cheerio.load(html);
+    const $ = cheerio.load(res.text);
     const json = [];
     const brands = $('table').find('td');
 
@@ -44,17 +45,19 @@ const getDevices = ($, devicesList) => {
 };
 
 const getBrand = async (brand) => {
-    let html = await getDataFromUrl(`/${brand}.php`);
+    let res = await fetchHtml(`https://www.gsmarena.com/${brand}.php`);
+    if (!res.text) return [];
 
-    let $ = cheerio.load(html);
+    let $ = cheerio.load(res.text);
     let json = [];
 
     let devices = getDevices($, $('.makers').find('li'));
     json = [...json, ...devices];
 
     while (getNextPage($)) {
-        html = await getDataFromUrl(`/${getNextPage($)}.php`);
-        $ = cheerio.load(html);
+        res = await fetchHtml(`https://www.gsmarena.com/${getNextPage($)}.php`);
+        if (!res.text) break;
+        $ = cheerio.load(res.text);
         devices = getDevices($, $('.makers').find('li'));
         json = [...json, ...devices];
     }
@@ -62,59 +65,72 @@ const getBrand = async (brand) => {
     return json;
 };
 
-const getDevice = async (device) => {
-    const html = await getDataFromUrl(`/${device}.php`);
-    const $ = cheerio.load(html);
+/**
+ * Extracts comprehensive device specifications
+ */
+const getDevice = async (device, options = {}) => {
+    const url = device.startsWith('http') ? device : `https://www.gsmarena.com/${device}.php`;
 
-    const displaySize = $('span[data-spec=displaysize-hl]').text();
-    const displayRes = $('div[data-spec=displayres-hl]').text();
-    const cameraPixels = $('.accent-camera').text();
-    const videoPixels = $('div[data-spec=videopixels-hl]').text();
-    const ramSize = $('.accent-expansion').text();
-    const chipset = $('div[data-spec=chipset-hl]').text();
-    const batterySize = $('.accent-battery').text();
-    const batteryType = $('div[data-spec=battype-hl]').text();
+    let res = await fetchHtml(url, options.signal, {}, { render: false, useProxy: true });
 
-    const quickSpec = [];
-    quickSpec.push({ name: 'Display size', value: displaySize });
-    quickSpec.push({ name: 'Display resolution', value: displayRes });
-    quickSpec.push({ name: 'Camera pixels', value: cameraPixels });
-    quickSpec.push({ name: 'Video pixels', value: videoPixels });
-    quickSpec.push({ name: 'RAM size', value: ramSize });
-    quickSpec.push({ name: 'Chipset', value: chipset });
-    quickSpec.push({ name: 'Battery size', value: batterySize });
-    quickSpec.push({ name: 'Battery type', value: batteryType });
+    if ((!res.text || res.turnstile) && options.allowRender) {
+        res = await fetchHtml(url, options.signal, {}, { render: true, useProxy: true });
+    }
+
+    if (!res.text) return null;
+
+    const $ = cheerio.load(res.text);
+    const specs = {};
+
+    // Extract main image URL robustly
+    let img = '';
+    const imgElement = $('.specs-photo-main img, #specs-cp-pic img, #specs-cp-main img, img[src*="/bigpic/"]').first();
+    if (imgElement.length > 0) {
+        img = imgElement.attr('src') || '';
+        if (img && !img.startsWith('http')) {
+            img = `https://www.gsmarena.com/${img.replace(/^\//, '')}`;
+        }
+    }
 
     const name = $('.specs-phone-name-title').text();
-    const img = $('.specs-photo-main a img').attr('src');
 
-    const specNode = $('table');
-    const detailSpec = [];
+    // Extract all spec tables
+    $('#specs-list table').each((_, table) => {
+        const sectionName = $(table).find('th').text().trim();
+        if (!sectionName) return;
 
-    specNode.each((i, el) => {
-        const specList = [];
-        const category = $(el).find('th').text();
-        const specN = $(el).find('tr');
-
-        specN.each((index, ele) => {
-            specList.push({
-                name: $('td.ttl', ele).text(),
-                value: $('td.nfo', ele).text(),
-            });
+        specs[sectionName] = {};
+        $(table).find('tr').each((_, tr) => {
+            const key = $(tr).find('.ttl').text().trim();
+            const value = $(tr).find('.nfo').text().trim();
+            if (key && value) {
+                specs[sectionName][key] = value;
+            }
         });
-        if (category) {
-            detailSpec.push({
-                category,
-                specifications: specList,
-            });
-        }
     });
+
+    // Quick specs for backward compatibility
+    const quickSpec = [
+        { name: 'Display size', value: $('span[data-spec=displaysize-hl]').text() },
+        { name: 'Display resolution', value: $('div[data-spec=displayres-hl]').text() },
+        { name: 'Camera pixels', value: $('.accent-camera').text() },
+        { name: 'Video pixels', value: $('div[data-spec=videopixels-hl]').text() },
+        { name: 'RAM size', value: $('.accent-expansion').text() },
+        { name: 'Chipset', value: $('div[data-spec=chipset-hl]').text() },
+        { name: 'Battery size', value: $('.accent-battery').text() },
+        { name: 'Battery type', value: $('div[data-spec=battype-hl]').text() }
+    ];
 
     return {
         name,
         img,
-        detailSpec,
+        specifications: specs,
         quickSpec,
+        // Keep old detailSpec format for legacy support
+        detailSpec: Object.entries(specs).map(([category, specifications]) => ({
+            category,
+            specifications: Object.entries(specifications).map(([name, value]) => ({ name, value }))
+        }))
     };
 };
 

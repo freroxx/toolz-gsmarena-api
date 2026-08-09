@@ -1,120 +1,207 @@
-// api/specs.ts
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import * as cheerio from 'cheerio';
 
-// Centralized fetch tool with optional proxy (api.scraperapi.com)
-async function fetchHtml(targetUrl: string): Promise<{ text: string | null; status: number | null; errorBody?: string }> {
+// Detect Cloudflare Turnstile / anti-bot pages quickly
+function isTurnstile(html: string): boolean {
+  if (!html) return false;
+  if (html.trim().startsWith('{') || html.trim().startsWith('[')) return false;
+
+  const lowered = html.toLowerCase();
+  return (
+    lowered.includes('cf-turnstile') ||
+    lowered.includes('turnstile') ||
+    lowered.includes('turnstile-verify') ||
+    lowered.includes('one quick check before you continue') ||
+    lowered.includes('meta name="turnstile"') ||
+    lowered.includes('challenge-form') ||
+    lowered.includes('verify you are human') ||
+    lowered.includes('cloudflare.com/static/cos/')
+  );
+}
+
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:123.0) Gecko/20100101 Firefox/123.0'
+];
+
+function getRandomUserAgent() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
+function getRemainingTime(startTime: number, totalBudget: number, minBuffer: number = 500): number {
+  const elapsed = Date.now() - startTime;
+  const remaining = totalBudget - elapsed;
+  return Math.max(remaining, minBuffer);
+}
+
+async function fetchHtml(
+  targetUrl: string,
+  signal?: AbortSignal,
+  extraHeaders: Record<string, string> = {},
+  options: { render?: boolean; timeoutMs?: number; useProxy?: boolean } = {}
+): Promise<{ text: string | null; status: number | null; errorBody?: string; turnstile?: boolean }> {
   const apiKey = process.env.SCRAPER_API_KEY;
-  let fetchUrl = targetUrl;
-  if (apiKey) {
+  const { render = false, useProxy = true } = options;
+  const timeoutMs = options.timeoutMs || (render ? 7000 : 4000);
+
+  let fetchUrl: string;
+  const isProxyActive = apiKey && useProxy;
+
+  if (isProxyActive) {
     const proxyUrl = new URL('https://api.scraperapi.com/');
     proxyUrl.searchParams.set('api_key', apiKey);
     proxyUrl.searchParams.set('url', targetUrl);
-    // render/premium/ultra_premium are paid-tier features — ScraperAPI 403s the
-    // whole request if your plan doesn't include them. Opt in via env vars so a
-    // free-plan key doesn't get rejected outright.
-    if (process.env.SCRAPER_RENDER === 'true') proxyUrl.searchParams.set('render', 'true');
-    if (process.env.SCRAPER_ULTRA_PREMIUM === 'true') proxyUrl.searchParams.set('ultra_premium', 'true');
-    else if (process.env.SCRAPER_PREMIUM === 'true') proxyUrl.searchParams.set('premium', 'true');
+    if (render) {
+      proxyUrl.searchParams.set('render', 'true');
+      if (process.env.SCRAPER_ULTRA_PREMIUM === 'true') {
+        proxyUrl.searchParams.set('ultra_premium', 'true');
+      } else {
+        proxyUrl.searchParams.set('premium', 'true');
+      }
+    }
     fetchUrl = proxyUrl.toString();
+  } else {
+    fetchUrl = targetUrl;
+  }
+
+  const internalController = new AbortController();
+  const internalTimeout = setTimeout(() => internalController.abort(), timeoutMs);
+
+  let combinedSignal: AbortSignal = internalController.signal;
+  if (signal) {
+    // @ts-ignore
+    if (typeof AbortSignal.any === 'function') {
+      combinedSignal = AbortSignal.any([internalController.signal, signal]);
+    } else {
+      signal.addEventListener('abort', () => internalController.abort());
+    }
   }
 
   try {
-    // Only apply fixed headers if NOT using ScraperAPI to prevent TLS fingerprint mismatches
-    const headers: Record<string, string> = {};
-    if (!apiKey) {
-      headers['User-Agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
+    const headers: Record<string, string> = { ...extraHeaders };
+    if (!isProxyActive) {
+      headers['User-Agent'] = getRandomUserAgent();
       headers['Accept-Language'] = 'en-US,en;q=0.9';
-      headers['Referer'] = 'https://www.google.com/';
+      headers['Referer'] = targetUrl.includes('gsmarena.com') ? 'https://www.gsmarena.com/' : 'https://www.google.com/';
     }
 
-    const response = await fetch(fetchUrl, { headers });
+    const response = await fetch(fetchUrl, { headers, signal: combinedSignal });
     const text = await response.text();
+
     if (!response.ok) {
-      console.error(`Fetch failed with status ${response.status} for ${targetUrl}. Body: ${text.slice(0, 500)}`);
-      return { text: null, status: response.status, errorBody: text.slice(0, 500) };
+      return { text, status: response.status, errorBody: text.slice(0, 200) };
     }
+
+    if (isTurnstile(text)) {
+      return { text, status: response.status, turnstile: true };
+    }
+
     return { text, status: response.status };
-  } catch (e) {
-    console.error('Network error fetching', targetUrl, e);
+  } catch (error: any) {
+    if (error.name === 'AbortError') {
+      return { text: null, status: 408, errorBody: signal?.aborted ? 'Global timeout' : 'Request timeout' };
+    }
     return { text: null, status: null };
+  } finally {
+    clearTimeout(internalTimeout);
   }
 }
 
-async function scrapeGsmArenaSearch(query: string): Promise<string | null> {
-  const searchUrl = new URL('https://www.gsmarena.com/results.php3');
-  searchUrl.searchParams.set('sQuickSearch', 'yes');
-  searchUrl.searchParams.set('sName', query);
+async function scrapeGsmArenaSearch(query: string, signal?: AbortSignal, startTime?: number, totalBudget: number = 9600) {
+  const searchUrl = `https://www.gsmarena.com/results.php3?sQuickSearch=yes&sName=${encodeURIComponent(query)}`;
 
-  const { text: html } = await fetchHtml(searchUrl.toString());
-  if (!html) return null;
+  let result = await fetchHtml(searchUrl, signal, {}, { render: false, timeoutMs: 5000, useProxy: true });
 
-  const lowered = html.toLowerCase();
-  // If we hit Turnstile or anti-bot, return null so the caller can handle it
-  if (lowered.includes('cf-turnstile') || lowered.includes('turnstile') || lowered.includes('turnstile-verify') || lowered.includes('one quick check before you continue')) {
-    return null;
+  if (result.turnstile && startTime) {
+    const remaining = getRemainingTime(startTime, totalBudget);
+    if (remaining > 6000) {
+      result = await fetchHtml(searchUrl, signal, {}, { render: true, timeoutMs: remaining - 500, useProxy: true });
+    }
   }
 
-  const $ = cheerio.load(html);
-  // If GSMArena redirected to product page (spec table present), prefer canonical
+  if (result.turnstile || !result.text) return null;
+
+  const $ = cheerio.load(result.text);
   if ($('#specs-list').length > 0) {
     const canonical = $('link[rel="canonical"]').attr('href') || $('meta[property="og:url"]').attr('content');
-    if (canonical) return canonical.startsWith('http') ? canonical : `https://www.gsmarena.com/${String(canonical).replace(/^\//, '')}`;
-    return searchUrl.toString();
+    if (canonical) {
+      return canonical.startsWith('http') ? canonical : `https://www.gsmarena.com/${String(canonical).replace(/^\//, '')}`;
+    }
+    return searchUrl;
   }
 
-  // Normal listing page: pick the first device link
   let firstDeviceLink = $('.makers ul li a').first().attr('href') || $('.makers a').first().attr('href');
-  if (firstDeviceLink) return `https://www.gsmarena.com/${String(firstDeviceLink).replace(/^\//, '')}`;
+  if (firstDeviceLink) {
+    return `https://www.gsmarena.com/${String(firstDeviceLink).replace(/^\//, '')}`;
+  }
 
   return null;
 }
 
-async function scrapeDeviceSpecs(url: string) {
-  const { text: html } = await fetchHtml(url);
-  if (!html) return null;
+async function scrapeDeviceSpecs(url: string, signal?: AbortSignal, options: { render?: boolean; timeoutMs?: number } = { render: false }) {
+  const { render = false } = options;
+  const { text: html, turnstile } = await fetchHtml(url, signal, {}, {
+    render,
+    timeoutMs: options.timeoutMs || (render ? 7000 : 4000)
+  });
 
-  // If Turnstile appears on the product page, bail
-  if (html.toLowerCase().includes('cf-turnstile') || html.toLowerCase().includes('turnstile')) return null;
+  if (turnstile || !html) return null;
 
   const $ = cheerio.load(html);
   const specs: Record<string, Record<string, string>> = {};
 
   $('#specs-list table').each((_, table) => {
-    const section = $(table).find('th').text().trim();
-    if (!section) return;
-    specs[section] = {};
-    $(table)
-      .find('tr')
-      .each((_, tr) => {
-        const key = $(tr).find('.ttl').text().trim();
-        const value = $(tr).find('.nfo').text().trim();
-        if (key && value) specs[section][key] = value;
-      });
+    const sectionName = $(table).find('th').text().trim();
+    if (!sectionName) return;
+
+    specs[sectionName] = {};
+    $(table).find('tr').each((_, tr) => {
+      const key = $(tr).find('.ttl').text().trim();
+      const value = $(tr).find('.nfo').text().trim();
+      if (key && value) {
+        specs[sectionName][key] = value;
+      }
+    });
   });
 
   return Object.keys(specs).length > 0 ? specs : null;
 }
 
-function generateStrategies(input: string): string[] {
-  let clean = input.toLowerCase().trim().replace(/\b(sm-|gt-|sch-|sgh-|sph-)/gi, '');
-  clean = clean.replace(/[\/:,#]/g, ' ').replace(/\s+/g, ' ').trim();
-  const parts = clean.split(/\s+/);
-  const strategies = [clean, parts.join('')];
+function generateSmartStrategies(input: string): string[] {
+  const lower = input.toLowerCase().trim();
+  const strategies = [lower];
+
+  let clean = lower.replace(/[\/:,#]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (clean !== lower) strategies.push(clean);
+
+  const splitSquashed = clean.replace(/([a-z])([0-9])/g, '$1 $2').replace(/([0-9])([a-z])/g, '$1 $2');
+  if (splitSquashed !== clean) strategies.push(splitSquashed);
+
+  const stripped = lower.replace(/\b(sm-|gt-|sch-|sgh-|sph-)/gi, '');
+  if (stripped !== lower) {
+      strategies.push(stripped.trim());
+      const cleanStripped = stripped.replace(/[\/:,#]/g, ' ').replace(/\s+/g, ' ').trim();
+      if (cleanStripped !== stripped) strategies.push(cleanStripped);
+  }
+
+  const parts = splitSquashed.split(/\s+/);
   if (parts.length > 1) {
     strategies.push(parts[parts.length - 1]);
     strategies.push(parts.slice(0, -1).join(' '));
   }
-  const last = parts[parts.length - 1];
-  const base = last.match(/[a-z]{1,2}\d{2}/i);
-  if (base) strategies.push(base[0]);
-  // brand hints
-  if (clean.includes('pixel') && !clean.includes('google')) strategies.unshift(`google ${clean}`);
-  if (clean.includes('galaxy') && !clean.includes('samsung')) strategies.unshift(`samsung ${clean}`);
-  return [...new Set(strategies)].filter(s => s && s.length >= 2);
+  strategies.push(parts.join(''));
+
+  return [...new Set(strategies)].filter(q => q && q.length >= 2);
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  const startTime = Date.now();
+  const totalBudget = 9600;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), totalBudget);
+
   try {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
@@ -126,84 +213,62 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const raw = String(req.query.model || '').trim();
     if (!raw) return res.status(400).json({ error: "Missing 'model' query parameter" });
 
-    // Limit strategies to top 3 variations to prevent hitting Vercel serverless execution timeout ceilings
-    const strategies = generateStrategies(raw).slice(0, 3);
+    const strategies = generateSmartStrategies(raw).slice(0, 3);
     const tried: any[] = [];
     let targetDeviceUrl: string | null = null;
 
-    // 1. Direct Search Evaluation Phase
+    // Phase 1: Direct Search
     for (const q of strategies) {
-      const url = await scrapeGsmArenaSearch(q);
+      console.info(`[Phase 1] Searching for ${q}...`);
+      const url = await scrapeGsmArenaSearch(q, controller.signal, startTime, totalBudget);
       tried.push({ query: q, matchedUrl: url });
       if (url) {
         targetDeviceUrl = url;
         break;
       }
+      if (getRemainingTime(startTime, totalBudget) < 3000) break;
     }
 
-    // 2. Fallback Search Engine Discovery Phase (Triggers on Turnstile lockout or search failures)
-    if (!targetDeviceUrl) {
-      console.info('Fallback Microservice: Search index block encountered. Running alternative index resolution...');
-      try {
-        const ddgUrl = new URL('https://html.duckduckgo.com/html/');
-        ddgUrl.searchParams.set('q', `site:gsmarena.com ${raw}`);
-        const { text: ddgHtml } = await fetchHtml(ddgUrl.toString());
+    // Phase 2: Fallback External Search
+    if (!targetDeviceUrl && getRemainingTime(startTime, totalBudget) > 4000) {
+      console.info(`[Phase 2] External discovery for ${raw}...`);
+      const ddgUrl = new URL('https://html.duckduckgo.com/html/');
+      ddgUrl.searchParams.set('q', `site:gsmarena.com ${raw}`);
+      const { text: ddgHtml } = await fetchHtml(ddgUrl.toString(), controller.signal, {}, { useProxy: false });
 
-        if (ddgHtml) {
-          const $ddg = cheerio.load(ddgHtml);
-          const discoveredLinks: string[] = [];
-
-          $ddg('a').each((_, el) => {
-            let href = $ddg(el).attr('href');
-            if (href && href.includes('gsmarena.com/')) {
-              if (href.includes('uddg=')) {
-                try {
-                  const urlParams = new URLSearchParams(href.substring(href.indexOf('?')));
-                  const exactUrl = urlParams.get('uddg');
-                  if (exactUrl) href = exactUrl;
-                } catch (e) {}
-              }
-
-              if (
-                href.includes('.php') &&
-                !href.includes('results.php') &&
-                !href.includes('search.php') &&
-                !href.includes('compare.php') &&
-                !href.includes('glossary.php') &&
-                !href.includes('blog.php')
-              ) {
-                discoveredLinks.push(href.startsWith('http') ? href : `https://www.gsmarena.com/${href.replace(/^\//, '')}`);
-              }
+      if (ddgHtml) {
+        const $ddg = cheerio.load(ddgHtml);
+        const discoveredLinks: string[] = [];
+        $ddg('a').each((_, el) => {
+          let href = $ddg(el).attr('href');
+          if (href && href.includes('gsmarena.com/')) {
+            if (href.includes('uddg=')) {
+              try { href = new URLSearchParams(href.split('?')[1]).get('uddg') || href; } catch (e) {}
             }
-          });
-
-          if (discoveredLinks.length > 0) {
-            targetDeviceUrl = discoveredLinks[0];
-            console.info('Fallback Microservice: Extracted target via discovery index traversal:', targetDeviceUrl);
-            tried.push({ query: raw, discoveryUrl: ddgUrl.toString(), matchedUrl: targetDeviceUrl, engine: 'duckduckgo' });
+            if (href.includes('.php') && !/results|search|compare|glossary|blog/i.test(href)) {
+              discoveredLinks.push(href.startsWith('http') ? href : `https://www.gsmarena.com/${href.replace(/^\//, '')}`);
+            }
           }
+        });
+        if (discoveredLinks.length > 0) {
+          targetDeviceUrl = discoveredLinks[0];
+          tried.push({ query: raw, engine: 'duckduckgo', matchedUrl: targetDeviceUrl });
         }
-      } catch (ddgError) {
-        console.error('Fallback Microservice Index Interception Failure:', ddgError);
       }
     }
 
-    // 3. Final Content Extraction Phase
     if (targetDeviceUrl) {
-      const specs = await scrapeDeviceSpecs(targetDeviceUrl);
+      const specs = await scrapeDeviceSpecs(targetDeviceUrl, controller.signal);
       if (specs) {
-        return res.status(200).json({ source_url: targetDeviceUrl, specifications: specs });
+        return res.status(200).json({ source_url: targetDeviceUrl, specifications: specs, timing_ms: Date.now() - startTime });
       }
-      return res.status(502).json({ error: 'Failed to extract specs from matched product page', source_url: targetDeviceUrl, tried });
     }
 
-    // Nothing matched
-    return res.status(404).json({ error: `No match for '${raw}'`, tried });
-  } catch (globalError) {
-    console.error("Critical error inside fallback microservice handler execution:", globalError);
-    return res.status(500).json({ 
-      error: "Internal Server Error encountered inside the processing framework", 
-      details: String(globalError) 
-    });
+    return res.status(404).json({ error: `No match for '${raw}'`, tried, timing_ms: Date.now() - startTime });
+  } catch (error) {
+    console.error("Critical error:", error);
+    return res.status(500).json({ error: "Internal Server Error" });
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
